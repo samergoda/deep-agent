@@ -1,0 +1,28 @@
+{
+  "name": "langchain-agent",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.ts",
+  "scripts": {
+    "start": "tsx --env-file=.env index.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@langchain/core": "^1.2.13",
+    "@langchain/openai": "^1.6.0",
+    "@tavily/core": "^0.7.13",
+    "deepagents": "^1.14.1",
+    "langchain": "^1.5.14",
+    "mathjs": "^14.9.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^5.9.3"
+  }
+}
