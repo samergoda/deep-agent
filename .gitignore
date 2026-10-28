@@ -12,3 +12,9 @@ npm-debug.log*
 
 # OS / editor
 .DS_Store
+
+# SSL certificates
+warpssl.crt
+
+# SQLite database
+data/

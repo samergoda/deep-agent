@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.ts",
   "scripts": {
-    "start": "tsx --env-file=.env index.ts",
+    "start": "NODE_EXTRA_CA_CERTS=./warpssl.crt tsx --env-file=.env index.ts",
+    "start:no-warp": "tsx --env-file=.env index.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -16,8 +17,8 @@
     "@langchain/openai": "^1.6.0",
     "@tavily/core": "^0.7.13",
     "deepagents": "^1.14.1",
-    "langchain": "^1.5.14",
     "mathjs": "^14.9.1",
+    "sql.js": "^1.15.2",
     "tsx": "^4.23.15",
     "zod": "^4.6.5"
   },

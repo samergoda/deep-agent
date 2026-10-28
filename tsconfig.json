@@ -12,5 +12,5 @@
     "resolveJsonModule": true,
     "noEmit": true
   },
-  "include": ["index.ts", "util/**/*.ts"]
+  "include": ["index.ts", "util/**/*.ts", "types/**/*.d.ts"]
 }

@@ -1,8 +1,11 @@
-import { tool } from "langchain";
+import { tool } from "@langchain/core/tools";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import * as z from "zod";
 import { tavily } from "@tavily/core";
+import { evaluate } from "mathjs";
+import { ALLOWED_READ_ROOTS, DEFAULT_TIMEZONE, GITLAB_TOKEN } from "./config";
+import { GitLabClient, parseMRUrl, formatMRDiff } from "./gitlab";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tavily client (initialized once, reused by webSearch)
@@ -42,14 +45,24 @@ export const webSearch = tool(
 
 export const calculator = tool(
   async (input: { expression: string }) => {
-    try {
-      const sanitized = input.expression.replace(/[^0-9+\-*/().%\s,e]/gi, "");
-      if (!sanitized.trim()) return "Invalid expression.";
+    const expression = input.expression.trim();
+    if (!expression) return "Invalid expression: input is empty.";
 
-      const result = Function(`"use strict"; return (${sanitized})`)();
-      return `${input.expression} = ${result}`;
+    try {
+      // mathjs safely parses and evaluates the expression without any use of
+      // eval/Function, so arbitrary JS cannot run. It supports arithmetic,
+      // percentages, functions (sqrt, sin, log, ...), and units.
+      const result = evaluate(expression);
+
+      // Reject non-numeric / non-displayable results (e.g. assignments, matrices
+      // we don't want to surface, or function definitions).
+      if (result === undefined || typeof result === "function") {
+        return `Could not evaluate: "${expression}". Provide a plain math expression.`;
+      }
+
+      return `${expression} = ${result}`;
     } catch {
-      return `Could not evaluate: "${input.expression}". Make sure it's a valid math expression.`;
+      return `Could not evaluate: "${expression}". Make sure it's a valid math expression.`;
     }
   },
   {
@@ -71,7 +84,7 @@ export const calculator = tool(
 
 export const dateTime = tool(
   async (input: { timezone?: string }) => {
-    const tz = input.timezone || "Asia/Amman";
+    const tz = input.timezone || DEFAULT_TIMEZONE;
     try {
       const now = new Date();
       const formatted = now.toLocaleString("en-US", {
@@ -99,7 +112,7 @@ export const dateTime = tool(
       timezone: z
         .string()
         .optional()
-        .describe("IANA timezone, e.g. 'America/New_York'. Defaults to Asia/Amman."),
+        .describe(`IANA timezone, e.g. 'America/New_York'. Defaults to ${DEFAULT_TIMEZONE}.`),
     }),
   }
 );
@@ -108,16 +121,22 @@ export const dateTime = tool(
 // 4. File Reader
 // ─────────────────────────────────────────────────────────────────────────────
 
-const ALLOWED_READ_ROOTS = ["/home/samer/"];
+/** True when `resolved` is the root itself or lives inside it (boundary-safe). */
+function isWithinRoot(resolved: string, root: string): boolean {
+  const normalizedRoot = root.endsWith(path.sep) ? root.slice(0, -1) : root;
+  return (
+    resolved === normalizedRoot ||
+    resolved.startsWith(normalizedRoot + path.sep)
+  );
+}
 
-export const readFile = tool(
+export const readLocalFile = tool(
   async (input: { filePath: string; startLine?: number; endLine?: number }) => {
     const resolved = path.resolve(input.filePath);
 
-    if (!ALLOWED_READ_ROOTS.some((root) => resolved.startsWith(root))) {
+    if (!ALLOWED_READ_ROOTS.some((root) => isWithinRoot(resolved, root))) {
       return `Error: Cannot read files outside of: ${ALLOWED_READ_ROOTS.join(", ")}`;
     }
-
     try {
       const stat = await fs.stat(resolved);
 
@@ -158,7 +177,7 @@ export const readFile = tool(
     }
   },
   {
-    name: "read_file",
+    name: "read_local_file",
     description:
       "Read the contents of a file or list the contents of a directory. " +
       "Use when the user asks about a local file, code, document, or folder.",
@@ -257,7 +276,156 @@ export const readUrl = tool(
 );
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 6. GitLab MR Review - Fetch MR Details and Diff
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const gitlabMRReview = tool(
+  async (input: { mrUrl: string }) => {
+    if (!GITLAB_TOKEN) {
+      return "Error: GITLAB_TOKEN is not configured. Add it to your .env file.";
+    }
+
+    try {
+      const mrInfo = parseMRUrl(input.mrUrl);
+      const client = new GitLabClient({
+        baseUrl: mrInfo.baseUrl,
+        token: GITLAB_TOKEN,
+      });
+
+      // Fetch MR details and changes in parallel
+      const [details, changes] = await Promise.all([
+        client.getMRDetails(mrInfo.projectPath, mrInfo.mrIid),
+        client.getMRChanges(mrInfo.projectPath, mrInfo.mrIid),
+      ]);
+
+      // Build a comprehensive review summary
+      const summary = [
+        `# Merge Request Review: ${details.title}`,
+        "",
+        `**MR #${details.iid}** | ${details.state.toUpperCase()}`,
+        `**Author:** ${details.author.name} (@${details.author.username})`,
+        `**Branch:** ${details.source_branch} → ${details.target_branch}`,
+        `**URL:** ${details.web_url}`,
+        "",
+        "## Description",
+        details.description || "_No description provided._",
+        "",
+        `## Changes (${changes.changes.length} files)`,
+        "",
+        formatMRDiff(changes.changes),
+      ].join("\n");
+
+      // Truncate if too long
+      if (summary.length > 50_000) {
+        return (
+          summary.slice(0, 50_000) +
+          "\n\n... [diff truncated due to size. Request specific files if needed.]"
+        );
+      }
+
+      return summary;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return `Error fetching MR: ${msg}`;
+    }
+  },
+  {
+    name: "gitlab_mr_review",
+    description:
+      "Fetch a GitLab Merge Request's details and code diff for review. " +
+      "Use this when the user provides a GitLab MR URL and wants you to review the code changes. " +
+      "After fetching, analyze the diff and provide feedback on code quality, bugs, security issues, " +
+      "best practices, and suggestions for improvement.",
+    schema: z.object({
+      mrUrl: z
+        .string()
+        .describe(
+          "The full GitLab MR URL, e.g. 'https://gitlab.example.com/group/project/-/merge_requests/123'"
+        ),
+    }),
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. GitLab MR Comment - Post Review Comments
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const gitlabMRComment = tool(
+  async (input: { mrUrl: string; comment: string; filePath?: string; lineNumber?: number }) => {
+    if (!GITLAB_TOKEN) {
+      return "Error: GITLAB_TOKEN is not configured. Add it to your .env file.";
+    }
+
+    try {
+      const mrInfo = parseMRUrl(input.mrUrl);
+      const client = new GitLabClient({
+        baseUrl: mrInfo.baseUrl,
+        token: GITLAB_TOKEN,
+      });
+
+      // If file and line are specified, post a line-level comment
+      if (input.filePath && input.lineNumber) {
+        const diffRefs = await client.getMRDiffRefs(mrInfo.projectPath, mrInfo.mrIid);
+        
+        await client.createMRLineComment(
+          mrInfo.projectPath,
+          mrInfo.mrIid,
+          input.comment,
+          {
+            baseSha: diffRefs.base_sha,
+            headSha: diffRefs.head_sha,
+            startSha: diffRefs.start_sha,
+            newPath: input.filePath,
+            newLine: input.lineNumber,
+          }
+        );
+
+        return `✅ Posted line comment on ${input.filePath}:${input.lineNumber}`;
+      }
+
+      // Otherwise, post a general comment
+      await client.createMRComment(mrInfo.projectPath, mrInfo.mrIid, input.comment);
+      return `✅ Posted general comment on MR #${mrInfo.mrIid}`;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return `Error posting comment: ${msg}`;
+    }
+  },
+  {
+    name: "gitlab_mr_comment",
+    description:
+      "Post a review comment on a GitLab Merge Request. Can post either a general comment " +
+      "or a line-specific comment on a particular file. Use after reviewing the MR diff to " +
+      "provide feedback directly on the merge request.",
+    schema: z.object({
+      mrUrl: z
+        .string()
+        .describe("The full GitLab MR URL"),
+      comment: z
+        .string()
+        .describe("The review comment text (supports Markdown)"),
+      filePath: z
+        .string()
+        .optional()
+        .describe("Optional: file path for line-level comment (e.g. 'src/utils.ts')"),
+      lineNumber: z
+        .number()
+        .optional()
+        .describe("Optional: line number for line-level comment (must be a new line in the diff)"),
+    }),
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Convenience: all tools as a single array for the agent
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const allTools = [webSearch, calculator, dateTime, readFile, readUrl];
+export const allTools = [
+  webSearch,
+  calculator,
+  dateTime,
+  readLocalFile,
+  readUrl,
+  gitlabMRReview,
+  gitlabMRComment,
+];
